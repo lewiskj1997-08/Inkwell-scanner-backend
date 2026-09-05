@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Local SQLite database (auto-created and seeded on boot)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Environment / secrets — never commit
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store

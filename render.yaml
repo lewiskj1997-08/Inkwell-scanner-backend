@@ -1,0 +1,37 @@
+# Render Blueprint for the Inkwell Scanner backend.
+#
+# This declares a single Node web service. Render reads this file when you create a
+# Blueprint from the repo. The four Stripe-related environment variables are declared
+# here by NAME only (sync: false) — their values are set in the Render dashboard
+# Environment → Secret Files / Environment Variables, never in this file.
+#
+#   STRIPE_SECRET_KEY      Stripe server-side API key (sk_live_... / sk_test_...)
+#   STRIPE_PRICE_MONTHLY   Stripe price ID for $2.99/month (price_...)
+#   STRIPE_PRICE_YEARLY    Stripe price ID for $19.99/year (price_...)
+#   STRIPE_WEBHOOK_SECRET  Stripe webhook signing secret (whsec_...)
+#
+# The service auto-seeds its 155-card catalog on first boot (SQLite data/ file).
+
+services:
+  - type: web
+    name: inkwell-scanner-backend
+    runtime: node
+    # Point at the backend directory (the repo may also contain the Android app,
+    # ML service, and website).
+    rootDir: backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    # Render injects PORT at runtime; src/index.js already binds process.env.PORT.
+    envVars:
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PRICE_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_YEARLY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
