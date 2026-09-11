@@ -7,6 +7,10 @@ const {
   tierForStatus,
   intervalForSubscription
 } = require('../utils/subscription-dates');
+const {
+  normalizeId,
+  resolveUserForSubscription
+} = require('../utils/webhook-user-resolution');
 
 const router = express.Router();
 
@@ -106,6 +110,16 @@ router.post('/create-checkout', authenticateToken, async (req, res) => {
       cancel_url: cancel_url || 'https://inkwell.app/subscription/cancel',
       metadata: {
         user_id: req.user.id
+      },
+      // Carry the user id on the resulting subscription itself (not just the
+      // session). This lets customer.subscription.* and invoice.* webhooks find
+      // the user even when checkout.session.completed arrives with a non-paid
+      // payment_status (async card auth / settlement) and never stores the
+      // Stripe ids on the user.
+      subscription_data: {
+        metadata: {
+          user_id: req.user.id
+        }
       }
     });
 
@@ -238,18 +252,25 @@ router.post('/webhook', async (req, res) => {
     return res.json({ received: true, duplicate: true });
   }
 
+  let outcome;
   try {
-    await handleWebhookEvent(db, event);
+    outcome = await handleWebhookEvent(db, event);
   } catch (err) {
     // Return 500 so Stripe retries; do NOT mark the event processed.
     console.error('Webhook event processing failed:', err);
     return res.status(500).json({ error: 'Webhook processing failed' });
   }
 
-  // Mark as processed only after successfully handling the event.
-  db.prepare(
-    'INSERT OR IGNORE INTO processed_webhook_events (event_id, event_type) VALUES (?, ?)'
-  ).run(event.id, event.type);
+  // Mark as processed only after successfully handling the event — UNLESS the
+  // handler explicitly deferred it (markProcessed: false), e.g. a
+  // checkout.session.completed that hasn't reached payment_status=paid yet.
+  // Skipping the idempotency insert lets Stripe re-deliver that event later once
+  // payment settles, instead of dropping it as a duplicate.
+  if (!outcome || outcome.markProcessed !== false) {
+    db.prepare(
+      'INSERT OR IGNORE INTO processed_webhook_events (event_id, event_type) VALUES (?, ?)'
+    ).run(event.id, event.type);
+  }
 
   res.json({ received: true });
 });
@@ -261,16 +282,19 @@ async function handleWebhookEvent(db, event) {
     case 'checkout.session.completed': {
       const session = event.data.object;
 
-      // Never grant premium unless the checkout was actually paid.
+      // Never grant premium unless the checkout was actually paid. If it isn't
+      // yet (async card auth / settlement), defer the event: return
+      // markProcessed:false so the router skips the idempotency insert and Stripe
+      // can re-deliver it once payment settles (instead of dropping it as a dup).
       if (!isPaidSession(session)) {
         console.warn(
-          `checkout.session.completed ignored: payment_status=${session.payment_status}`
+          `checkout.session.completed deferred: payment_status=${session.payment_status}`
         );
-        break;
+        return { markProcessed: false };
       }
 
       const userId = session.metadata?.user_id || session.client_reference_id;
-      if (!userId) break;
+      if (!userId) return { markProcessed: true };
 
       // Derive the end date from the actual subscription. Read the subscription's
       // current_period_end (authoritative, handles monthly AND yearly), falling back
@@ -302,20 +326,23 @@ async function handleWebhookEvent(db, event) {
           updated_at = datetime('now')
          WHERE id = ?`
       ).run(session.customer, session.subscription, endDate.toISOString(), userId);
-      break;
+      return { markProcessed: true };
     }
 
     case 'customer.subscription.created':
     case 'customer.subscription.updated': {
       const subscription = event.data.object;
-      // Match by subscription id first, then by customer id (covers the case where
-      // checkout.session.completed hasn't stored the sub id yet).
-      const user = db.prepare(
-        `SELECT id, stripe_subscription_id, stripe_customer_id FROM users
-         WHERE stripe_subscription_id = ? OR stripe_customer_id = ?`
-      ).get(subscription.id, subscription.customer);
+      // Resolve the user in priority order: subscription metadata user_id (new
+      // checkouts), stored Stripe ids (fast path), then email fallback (retrieve
+      // the customer). This covers the case where checkout.session.completed never
+      // stored the Stripe ids because it fired with a non-paid payment_status.
+      const userId = await resolveUserForSubscription(db, {
+        metadataUserId: subscription.metadata?.user_id,
+        subscriptionId: subscription.id,
+        customerId: subscription.customer
+      }, retrieveCustomerEmail);
 
-      if (!user) break;
+      if (!userId) return { markProcessed: true };
 
       const endDate = deriveEndDate({
         currentPeriodEnd: subscription.current_period_end,
@@ -334,33 +361,64 @@ async function handleWebhookEvent(db, event) {
       ).run(
         tierForStatus(subscription.status),
         subscription.status,
-        subscription.customer,
+        normalizeId(subscription.customer),
         subscription.id,
         endDate.toISOString(),
-        user.id
+        userId
       );
-      break;
+      return { markProcessed: true };
     }
 
     case 'invoice.payment_succeeded': {
       const invoice = event.data.object;
-      const subscriptionId = invoice.subscription;
-      if (subscriptionId) {
-        // Re-activate on successful renewal/charge (clears any past_due flag).
-        const endDate = new Date(
-          invoice.lines?.data?.[0]?.period?.end * 1000 ||
-          Date.now() + 30 * 24 * 60 * 60 * 1000
-        );
-        db.prepare(
-          `UPDATE users SET
-            subscription_tier = 'premium',
-            subscription_status = 'active',
-            subscription_end_date = ?,
-            updated_at = datetime('now')
-           WHERE stripe_subscription_id = ?`
-        ).run(endDate.toISOString(), subscriptionId);
+      const subscriptionId = normalizeId(invoice.subscription);
+      if (!subscriptionId) return { markProcessed: true };
+
+      // Read the subscription's own metadata.user_id (best-effort; the invoice
+      // object does not carry subscription metadata directly).
+      let metadataUserId = null;
+      try {
+        const sub = await stripe.subscriptions.retrieve(subscriptionId);
+        metadataUserId = sub?.metadata?.user_id;
+      } catch (err) {
+        console.warn('Could not retrieve subscription metadata for invoice:', err.message);
       }
-      break;
+
+      // Resolve the user: metadata user_id, stored Stripe ids, then the invoice's
+      // customer_email (or the customer's email from the API). The email fallback
+      // recovers a paid subscription whose checkout.session.completed never stored
+      // the Stripe ids on the user.
+      const userId = await resolveUserForSubscription(db, {
+        metadataUserId,
+        subscriptionId,
+        customerId: invoice.customer,
+        customerEmail: invoice.customer_email
+      }, retrieveCustomerEmail);
+
+      if (!userId) return { markProcessed: true };
+
+      // Re-activate on successful renewal/charge (clears any past_due flag), and
+      // persist the Stripe ids so later events match via the fast path.
+      const endDate = new Date(
+        invoice.lines?.data?.[0]?.period?.end * 1000 ||
+        Date.now() + 30 * 24 * 60 * 60 * 1000
+      );
+      db.prepare(
+        `UPDATE users SET
+          subscription_tier = 'premium',
+          subscription_status = 'active',
+          stripe_subscription_id = ?,
+          stripe_customer_id = ?,
+          subscription_end_date = ?,
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        subscriptionId,
+        normalizeId(invoice.customer),
+        endDate.toISOString(),
+        userId
+      );
+      return { markProcessed: true };
     }
 
     case 'invoice.payment_failed': {
@@ -376,7 +434,7 @@ async function handleWebhookEvent(db, event) {
            WHERE stripe_subscription_id = ?`
         ).run(subscriptionId);
       }
-      break;
+      return { markProcessed: true };
     }
 
     case 'customer.subscription.deleted': {
@@ -389,8 +447,24 @@ async function handleWebhookEvent(db, event) {
           updated_at = datetime('now')
          WHERE stripe_subscription_id = ?`
       ).run(subscription.id);
-      break;
+      return { markProcessed: true };
     }
+  }
+
+  return { markProcessed: true };
+}
+
+// Retrieve a customer's email from Stripe, for the webhook email fallback.
+// Returns null (never throws) when there is no Stripe client or the lookup fails.
+async function retrieveCustomerEmail(customerId) {
+  const id = normalizeId(customerId);
+  if (!id || !stripe) return null;
+  try {
+    const customer = await stripe.customers.retrieve(id);
+    return customer && typeof customer.email === 'string' ? customer.email : null;
+  } catch (err) {
+    console.warn('Could not retrieve Stripe customer for email fallback:', err.message);
+    return null;
   }
 }
 
